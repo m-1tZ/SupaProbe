@@ -20,6 +20,7 @@ options:
 ```
 $ python3 supaprobe.py --jwt "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im[...]" https://<id>.supabase.co
 
+[!] Able to signup new user without restrictions -> anonymous signup enabled.
 [!] Found accessible table via READ: accounts
 [!] Found accessible table via READ: Account
 [!] Found accessible table via READ: Person
@@ -40,8 +41,15 @@ $ python3 supaprobe.py --jwt "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzd
 [!] Able to READ from table 'test'
 [!] Attempted WRITE on 'test', response: {"code":"PGRST204","details":null,"hint":null,"message":"Could not find the 'some_column' column of 'test' in the schema cache"}
 [!] Able to DELETE rows in 'test' (or column leak)
+[!] Stored procedure 'http_delete' callable with provided JWT.
+[!] Stored procedure 'http_patch' callable with provided JWT.
 [!] Stored procedure 'test' callable with provided JWT.
+[!] Stored procedure 'http_put' callable with provided JWT.
+[!] Stored procedure 'http_post' callable with provided JWT.
+[!] Bucket 'test' items listing available.
 [!] Bucket 'test' is public but wrong key supplied -> open bucket.
-[!] Able to signup new user without restrictions -> anonymous signup enabled.
+[!] Bucket 'static' is public but wrong key supplied -> open bucket.
+[+] Uploaded object in 'test/audit_test.txt'
+[!] Deleted object in 'test'
 [!] Edge Function 'database-access' callable with provided credentials
 ```
