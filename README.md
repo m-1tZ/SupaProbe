@@ -1,5 +1,5 @@
 # SupaProbe - A Supabase probing tool
-This tool was written during a deep dive into Supabase - see my [blogpost](https://blog.m1tz.com/sdf)
+This tool was written during a deep dive into Supabase - see my [blog post]([https://blog.m1tz.com/supabase](https://blog.m1tz.com/posts/2025/10/a-hands-on-edition-will-supabase-be-the-next-firebase-at-least-in-terms-of-security/))
 
 ```
 $ python3 supaprobe.py -h
