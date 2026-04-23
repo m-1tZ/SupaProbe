@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+import re
 import requests
 import json
 import urllib3
@@ -15,13 +16,31 @@ COMMON_FUNCTIONS = [
     "stripe-webhook", "openai-proxy", "upload-file", "send-email",
     "generate-og-image", "get-user-location", "postgres-api", "restful-service",
     "turnstile-protect", "postgres-integration", "oak-middleware", "discord-bot",
-    "telegram-bot", "docs-upload",
+    "telegram-bot", "docs-upload", "vehicle-lookup"
 ]
 
-COMMON_BUCKETS = [
-    "test", "public", "uploads", "files", "documents", "images", "avatars",
-    "assets", "static", "data", "backup", "backups", "objects", "user-images",
-    "assistant-images", "invoices",
+# Used as seed list for both storage bucket guessing and table name brute-forcing.
+# Bucket names are typically hyphenated slugs; table names are typically snake_case —
+# both forms are kept so the list works for either purpose without transformation.
+COMMON_BUCKETS_TABLES = [
+    # --- storage-style slugs (hyphens) ---
+    "user-images", "assistant-images",
+    # --- generic storage / file buckets ---
+    "uploads", "files", "documents", "images", "avatars", "assets", "static",
+    "objects", "backup", "backups", "public",
+    # --- common DB table names (snake_case / lowercase) ---
+    "users", "user", "accounts", "account", "profiles", "profile",
+    "sessions", "tokens", "keys", "secrets", "credentials",
+    "roles", "permissions", "policies",
+    "orgs", "organizations", "teams", "members", "memberships",
+    "workspaces", "projects", "tasks", "todos", "issues",
+    "posts", "comments", "likes", "reactions", "tags", "categories",
+    "messages", "notifications", "events", "logs", "audit_logs",
+    "orders", "invoices", "payments", "subscriptions", "plans", "products",
+    "customers", "contacts", "leads", "companies",
+    "emails", "email_templates",
+    "settings", "config", "features", "flags",
+    "data", "test", "dev", "staging",
 ]
 
 
@@ -275,43 +294,153 @@ def test_storage_ops(session, storage_object_url, discovered_buckets, jwt, token
     return findings
 
 
-def discover_open_schema(session, schema_url, jwt, token):
+def _pascal_to_snake(name: str) -> str:
+    """Convert PascalCase to snake_case."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower().strip("_")
+
+
+def discover_open_schema(session, rest_url, graphql_url, jwt, token):
     bearer_jwt = token or jwt
-    discovered_tables = []
-    discovered_functions = []
+
+    discovered_tables = set()
+    discovered_functions = set()
+
+    headers = {
+        "Authorization": f"Bearer {bearer_jwt}",
+        "apikey": jwt,
+        "Content-Type": "application/json",
+    }
+
+    # -----------------------
+    # 1. Try REST (OpenAPI)
+    # -----------------------
+    try:
+        r = session.get(rest_url, headers=headers, timeout=7)
+
+        if r.status_code == 200:
+            swagger_json = r.json()
+
+            print_curl_example(
+                "OpenAPI schema (REST)",
+                f"curl '{rest_url}' -H 'apikey: {jwt}' -H 'Authorization: Bearer {bearer_jwt}'"
+            )
+
+            for path in swagger_json.get("paths", {}):
+                if path.startswith("/rpc/"):
+                    discovered_functions.add(path.replace("/rpc/", ""))
+                elif path.startswith("/") and path != "/":
+                    discovered_tables.add(path.lstrip("/"))
+
+        else:
+            print(f"[-] REST schema access blocked ({r.status_code}) → trying GraphQL")
+
+    except requests.RequestException:
+        print("[-] REST schema request failed → trying GraphQL")
+
+    # -----------------------
+    # 2. GraphQL (pg_graphql)
+    # -----------------------
+    # Strategy: query queryType.fields — in pg_graphql every exposed table/view
+    # appears here as a "<TableName>Collection" field (return type ends in
+    # "Connection").  Plain scalar fields are RPC/stored-procedure proxies.
+    # mutationType.fields give us a second signal: insertInto/update/deleteFrom
+    # prefixes reveal tables even when reads are locked down by RLS.
+    gql_query = {
+        "query": """
+        {
+          __schema {
+            queryType {
+              fields {
+                name
+                type {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                  }
+                }
+              }
+            }
+            mutationType {
+              fields {
+                name
+              }
+            }
+          }
+        }
+        """
+    }
 
     try:
-        r = session.get(
-            schema_url,
-            headers={"Authorization": f"Bearer {bearer_jwt}", "apikey": jwt},
-            timeout=7,
-        )
+        r = session.post(graphql_url, headers=headers, json=gql_query, timeout=7)
+
+        if r.status_code == 200 and "data" in r.text:
+            data = r.json()
+
+            print_curl_example(
+                "GraphQL schema introspection",
+                f"curl -X POST '{graphql_url}' -H 'apikey: {jwt}' "
+                f"-H 'Authorization: Bearer {bearer_jwt}' "
+                f"-H 'Content-Type: application/json' "
+                f"-d '{json.dumps(gql_query)}'"
+            )
+
+            schema = data.get("data", {}).get("__schema", {})
+
+            # --- queryType: tables vs RPC functions ---
+            # pg_graphql exposes tables as fields whose return type name ends in
+            # "Connection" (e.g. UsersCollection → UsersConnection).
+            query_fields = schema.get("queryType", {}).get("fields") or []
+            for field in query_fields:
+                name      = field.get("name", "")
+                type_info = field.get("type", {})
+                type_name = type_info.get("name") or ""
+                of_name   = (type_info.get("ofType") or {}).get("name") or ""
+
+                connection_name = type_name if type_name.endswith("Connection") \
+                                  else of_name if of_name.endswith("Connection") \
+                                  else None
+
+                if connection_name:
+                    # Strip "Connection" suffix, convert PascalCase → snake_case
+                    raw   = connection_name[: -len("Connection")]
+                    snake = _pascal_to_snake(raw)
+                    if snake:
+                        discovered_tables.add(snake)
+                        print(f"[GraphQL] Table (queryType): {snake}")
+                elif name not in ("node",):
+                    # Non-Connection, non-noise → likely an RPC proxy
+                    discovered_functions.add(name)
+                    print(f"[GraphQL] Function (queryType): {name}")
+
+            # --- mutationType: secondary table signal ---
+            # Mutation names follow: insertInto<Table>Collection,
+            # update<Table>Collection, deleteFrom<Table>Collection
+            mutation_fields = schema.get("mutationType", {}).get("fields") or []
+            for field in mutation_fields:
+                name = field.get("name", "")
+                for prefix in ("insertInto", "update", "deleteFrom"):
+                    if name.startswith(prefix):
+                        raw   = name[len(prefix):].replace("Collection", "")
+                        snake = _pascal_to_snake(raw)
+                        if snake and snake not in discovered_tables:
+                            discovered_tables.add(snake)
+                            print(f"[GraphQL] Table (mutationType/{prefix}): {snake}")
+                        break
+
+        else:
+            print(f"[-] GraphQL introspection failed ({r.status_code})")
+
     except requests.RequestException:
-        return discovered_tables, discovered_functions
+        print("[-] GraphQL request failed")
 
-    if r.status_code != 200:
-        return discovered_tables, discovered_functions
-
-    swagger_json = r.json()
-    if swagger_json:
-        print_curl_example(
-            "Open API Schema found",
-            f"curl '{schema_url}' -H 'apikey: {jwt}' -H 'Authorization: Bearer {bearer_jwt}'"
-        )
-        for path in swagger_json.get("paths", {}):
-            if path.startswith("/") and path != "/":
-                if path.startswith("/rpc/"):
-                    discovered_functions.append(path.replace("/rpc/", ""))
-                else:
-                    discovered_tables.append(path.lstrip("/"))
-
-    print(discovered_tables, discovered_functions)
-    return discovered_tables, discovered_functions
+    return list(discovered_tables), list(discovered_functions)
 
 
-def discover_storage_buckets(session, storage_object_url, bucket_url, jwt, token):
+def discover_storage_buckets(session, storage_object_url, bucket_url, jwt, token, seed_list=None):
     findings = []
-    discovered_buckets = list(COMMON_BUCKETS)
+    discovered_buckets = list(seed_list) if seed_list is not None else list(COMMON_BUCKETS_TABLES)
     bearer_jwt = token or jwt
     headers = {"Authorization": f"Bearer {bearer_jwt}", "apikey": jwt}
 
@@ -363,6 +492,8 @@ def discover_storage_buckets(session, storage_object_url, bucket_url, jwt, token
 
 
 def test_supabase(session, url, jwt, token):
+
+    graphql_url = url.rstrip("/") + "/graphql/v1"
     rest_url      = url.rstrip("/") + "/rest/v1/"
     func_url      = url.rstrip("/") + "/functions/v1/"
     auth_url      = url.rstrip("/") + "/auth/v1/"
@@ -375,7 +506,7 @@ def test_supabase(session, url, jwt, token):
     findings.extend(test_signup(session, auth_url, jwt))
 
     # Schema discovery
-    discovered_tables, discovered_functions = discover_open_schema(session, rest_url, jwt, token)
+    discovered_tables, discovered_functions = discover_open_schema(session, rest_url, graphql_url, jwt, token)
 
     if discovered_functions:
         print("[!] Found Functions:", discovered_functions)
@@ -388,15 +519,21 @@ def test_supabase(session, url, jwt, token):
                 f"curl '{rest_url}{table}?select=*' -H 'apikey: {jwt}' -H 'Authorization: Bearer {token or jwt}'"
             )
 
-    # CRUD
-    if discovered_tables:
-        findings.extend(test_crud_operations(session, rest_url, jwt, discovered_tables, token))
+    # Merge discovered tables into the common seed list so storage probing and
+    # CRUD both benefit from schema-derived names without duplicates.
+    combined_tables = list(COMMON_BUCKETS_TABLES)
+    for t in discovered_tables:
+        if t not in combined_tables:
+            combined_tables.append(t)
+
+    # CRUD — run against the full combined list
+    findings.extend(test_crud_operations(session, rest_url, jwt, combined_tables, token))
 
     # Stored procedures
     findings.extend(test_stored_procedures(session, rest_url, jwt, discovered_functions, token))
 
-    # Storage
-    new_findings, discovered_buckets = discover_storage_buckets(session, storage_url, bucket_url, jwt, token)
+    # Storage — pass combined list so discovered table names are also probed as bucket names
+    new_findings, discovered_buckets = discover_storage_buckets(session, storage_url, bucket_url, jwt, token, combined_tables)
     findings.extend(new_findings)
     findings.extend(test_storage_ops(session, storage_url, discovered_buckets, jwt, token))
 
